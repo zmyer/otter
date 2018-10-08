@@ -17,6 +17,7 @@
 package com.alibaba.otter.node.etl.select.selector.canal;
 
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -39,7 +40,11 @@ import com.alibaba.otter.canal.instance.manager.model.CanalParameter.HAMode;
 import com.alibaba.otter.canal.parse.CanalEventParser;
 import com.alibaba.otter.canal.parse.ha.CanalHAController;
 import com.alibaba.otter.canal.parse.inbound.mysql.MysqlEventParser;
+import com.alibaba.otter.canal.parse.inbound.mysql.tsdb.DefaultTableMetaTSDBFactory;
+import com.alibaba.otter.canal.parse.inbound.mysql.tsdb.TableMetaTSDB;
+import com.alibaba.otter.canal.parse.inbound.mysql.tsdb.TableMetaTSDBBuilder;
 import com.alibaba.otter.canal.parse.support.AuthenticationInfo;
+import com.alibaba.otter.canal.protocol.CanalEntry;
 import com.alibaba.otter.canal.protocol.CanalEntry.Entry;
 import com.alibaba.otter.canal.protocol.ClientIdentity;
 import com.alibaba.otter.canal.server.embedded.CanalServerWithEmbedded;
@@ -48,12 +53,15 @@ import com.alibaba.otter.canal.sink.CanalEventSink;
 import com.alibaba.otter.node.common.config.ConfigClientService;
 import com.alibaba.otter.node.etl.OtterConstants;
 import com.alibaba.otter.node.etl.OtterContextLocator;
+import com.alibaba.otter.node.etl.select.exceptions.SelectException;
 import com.alibaba.otter.node.etl.select.selector.Message;
 import com.alibaba.otter.node.etl.select.selector.MessageDumper;
 import com.alibaba.otter.node.etl.select.selector.MessageParser;
 import com.alibaba.otter.node.etl.select.selector.OtterSelector;
 import com.alibaba.otter.shared.common.model.config.pipeline.Pipeline;
 import com.alibaba.otter.shared.etl.model.EventData;
+import com.google.protobuf.ByteString;
+import com.google.protobuf.InvalidProtocolBufferException;
 
 /**
  * 基于canal embed实现数据获取方式
@@ -163,8 +171,36 @@ public class CanalEmbedSelector implements OtterSelector {
                             }
 
                             MysqlEventParser mysqlEventParser = (MysqlEventParser) eventParser;
-                            CanalHAController haController = mysqlEventParser.getHaController();
+                            if (parameters.getTsdbEnable()) {
+                                mysqlEventParser.setEnableTsdb(true);
+                                mysqlEventParser.setTableMetaTSDBFactory(new DefaultTableMetaTSDBFactory() {
 
+                                    @Override
+                                    public void destory(String destination) {
+                                        TableMetaTSDBBuilder.destory(destination);
+                                    }
+
+                                    @Override
+                                    public TableMetaTSDB build(String destination, String springXml) {
+                                        try {
+                                            System.setProperty("canal.instance.tsdb.url", parameters.getTsdbJdbcUrl());
+                                            System.setProperty("canal.instance.tsdb.dbUsername",
+                                                parameters.getTsdbJdbcUserName());
+                                            System.setProperty("canal.instance.tsdb.dbPassword",
+                                                parameters.getTsdbJdbcPassword());
+
+                                            return TableMetaTSDBBuilder.build(destination,
+                                                "classpath:spring/tsdb/mysql-tsdb.xml");
+                                        } finally {
+                                            System.setProperty("canal.instance.tsdb.url", "");
+                                            System.setProperty("canal.instance.tsdb.dbUsername", "");
+                                            System.setProperty("canal.instance.tsdb.dbPassword", "");
+                                        }
+                                    }
+                                });
+                            }
+
+                            CanalHAController haController = mysqlEventParser.getHaController();
                             if (haController instanceof MediaHAController) {
                                 if (isGroup) {
                                     throw new CanalException("not support group database use media HA");
@@ -255,11 +291,25 @@ public class CanalEmbedSelector implements OtterSelector {
             }
         }
 
-        List<EventData> eventDatas = messageParser.parse(pipelineId, message.getEntries()); // 过滤事务头/尾和回环数据
+        List<Entry> entries = null;
+        if (message.isRaw()) {
+            entries = new ArrayList<CanalEntry.Entry>(message.getRawEntries().size());
+            for (ByteString entry : message.getRawEntries()) {
+                try {
+                    entries.add(CanalEntry.Entry.parseFrom(entry));
+                } catch (InvalidProtocolBufferException e) {
+                    throw new SelectException(e);
+                }
+            }
+        } else {
+            entries = message.getEntries();
+        }
+
+        List<EventData> eventDatas = messageParser.parse(pipelineId, entries); // 过滤事务头/尾和回环数据
         Message<EventData> result = new Message<EventData>(message.getId(), eventDatas);
         // 更新一下最后的entry时间，包括被过滤的数据
-        if (!CollectionUtils.isEmpty(message.getEntries())) {
-            long lastEntryTime = message.getEntries().get(message.getEntries().size() - 1).getHeader().getExecuteTime();
+        if (!CollectionUtils.isEmpty(entries)) {
+            long lastEntryTime = entries.get(entries.size() - 1).getHeader().getExecuteTime();
             if (lastEntryTime > 0) {// oracle的时间可能为0
                 this.lastEntryTime = lastEntryTime;
             }
@@ -268,12 +318,12 @@ public class CanalEmbedSelector implements OtterSelector {
         if (dump && logger.isInfoEnabled()) {
             String startPosition = null;
             String endPosition = null;
-            if (!CollectionUtils.isEmpty(message.getEntries())) {
-                startPosition = buildPositionForDump(message.getEntries().get(0));
-                endPosition = buildPositionForDump(message.getEntries().get(message.getEntries().size() - 1));
+            if (!CollectionUtils.isEmpty(entries)) {
+                startPosition = buildPositionForDump(entries.get(0));
+                endPosition = buildPositionForDump(entries.get(entries.size() - 1));
             }
 
-            dumpMessages(result, startPosition, endPosition, message.getEntries().size());// 记录一下，方便追查问题
+            dumpMessages(result, startPosition, endPosition, entries.size());// 记录一下，方便追查问题
         }
         return result;
     }
